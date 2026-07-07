@@ -4,6 +4,11 @@
   "description": "Shows Claude Code session and weekly usage with progress bars in the VS Code status bar",
   "version": "0.0.1",
   "publisher": "local",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arie-snfai/claude-usage-statusbar.git"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },

@@ -44,8 +44,8 @@ underlying data source keeps working at all.
 
 ## Install
 
-Grab the `.vsix` from [Releases](../../releases) (or build it yourself, see
-below), then:
+Grab the `.vsix` from [Releases](https://github.com/arie-snfai/claude-usage-statusbar/releases)
+(or build it yourself, see below), then:
 
 - VS Code UI: Extensions view → `...` menu → **"Install from VSIX..."**
 - CLI: `code --install-extension claude-usage-statusbar-*.vsix`
