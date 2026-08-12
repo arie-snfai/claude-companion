@@ -2,7 +2,7 @@
   "name": "claude-companion",
   "displayName": "Claude Companion",
   "description": "Claude Code session and weekly usage in the status bar, color-coded by burn rate, with automatic session restart when the 5h window resets and automatic continuation of work the limit cut off",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "publisher": "local",
   "repository": {
     "type": "git",
