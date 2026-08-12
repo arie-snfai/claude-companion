@@ -1,8 +1,9 @@
-# Claude Usage Status Bar
+# Claude Companion
 
 A standalone VS Code extension that shows your Claude Code **session (5h)** and
 **weekly (7d)** usage as progress bars in the status bar, color-coded by burn
-rate rather than raw percentage.
+rate rather than raw percentage - and optionally opens a fresh session for you
+the moment the 5h window resets.
 
 ![status bar example](https://img.shields.io/badge/status-experimental-orange)
 
@@ -22,6 +23,30 @@ pace ratio = (fraction of quota used) / (fraction of window elapsed)
 - **red** — 1.3x+, or usage ≥ 95% regardless of pace
 
 Hover either item for the exact numbers and the reset time.
+
+## Auto-start a new session at reset
+
+When the 5h session window expires, the extension fires one trivial `claude -p`
+turn so a fresh window opens immediately instead of waiting for you to send the
+first message. Run it manually any time with **"Claude Companion: Start New Session
+Now"** from the command palette.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `claudeCompanion.autoStartSession.enabled` | `true` | Fire the ping at every 5h reset |
+| `claudeCompanion.autoStartSession.prompt` | `"hi"` | What gets sent |
+
+Two things to know before leaving it on:
+
+- Each ping is a real turn and costs a small amount of your **weekly** quota.
+- The ping **anchors** the new window. Ping at 07:40 and sit down at 08:00, and
+  that window expires at 12:40, not 13:00. Over a day your reset boundaries
+  drift to wherever the pings landed. That is the point of the feature - there
+  is always a live window - but set `enabled` to `false` if you would rather
+  your windows line up with when you actually start working.
+
+The ping runs from the OS temp dir, so no workspace `CLAUDE.md` or repo context
+is pulled into it.
 
 ## How it works
 
@@ -44,11 +69,11 @@ underlying data source keeps working at all.
 
 ## Install
 
-Grab the `.vsix` from [Releases](https://github.com/arie-snfai/claude-usage-statusbar/releases)
+Grab the `.vsix` from [Releases](https://github.com/arie-snfai/claude-companion/releases)
 (or build it yourself, see below), then:
 
 - VS Code UI: Extensions view → `...` menu → **"Install from VSIX..."**
-- CLI: `code --install-extension claude-usage-statusbar-*.vsix`
+- CLI: `code --install-extension claude-companion-*.vsix`
 
 Reload the window afterwards.
 
@@ -58,7 +83,7 @@ Reload the window afterwards.
 npm install
 npm run compile
 npx @vscode/vsce package
-code --install-extension claude-usage-statusbar-*.vsix
+code --install-extension claude-companion-*.vsix
 ```
 
 ## License

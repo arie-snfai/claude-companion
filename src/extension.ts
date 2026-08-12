@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
-import { spawn, ChildProcessWithoutNullStreams } from "child_process";
+import { spawn, ChildProcess, ChildProcessWithoutNullStreams } from "child_process";
 
 const REFRESH_INTERVAL_MS = 5 * 60_000;
 const REQUEST_TIMEOUT_MS = 8_000;
@@ -9,6 +10,14 @@ const BAR_WIDTH = 10;
 // Consecutive polls with no usable data before we stop showing stale numbers
 // and fall back to the warning state (3 polls * 5 min interval = 15 min).
 const MAX_STALE_POLLS = 3;
+
+// Small cushion after the reported reset timestamp before we ping — firing on
+// the exact boundary risks the server still counting the request against the
+// window that just closed.
+const PING_GRACE_MS = 5_000;
+// A one-shot `claude -p` turn is normally a few seconds; anything past this is
+// a hung process, not a slow answer.
+const PING_TIMEOUT_MS = 120_000;
 
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
@@ -46,32 +55,166 @@ let refreshTimer: ReturnType<typeof setInterval> | undefined;
 let lastGoodUsage: UsageResponse | undefined;
 let staleStreak = 0;
 
+// Auto-restart state. `scheduledResetIso` is the boundary the armed timer is
+// waiting on; `lastPingedResetIso` is the boundary we already acted on, so a
+// poll that still reports the old (now past) reset time can't re-fire.
+let resetTimer: ReturnType<typeof setTimeout> | undefined;
+let scheduledResetIso: string | undefined;
+let lastPingedResetIso: string | undefined;
+let pingChild: ChildProcess | undefined;
+
 export function activate(context: vscode.ExtensionContext): void {
   sessionItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, -1_000_000);
   weeklyItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, -1_000_001);
 
   const allItems = [sessionItem, weeklyItem];
   for (const item of allItems) {
-    item.command = "claudeUsageStatusBar.refresh";
+    item.command = "claudeCompanion.refresh";
     item.show();
   }
 
   context.subscriptions.push(...allItems);
   context.subscriptions.push(
-    vscode.commands.registerCommand("claudeUsageStatusBar.refresh", () => void updateStatusBar()),
+    vscode.commands.registerCommand("claudeCompanion.refresh", () => void updateStatusBar()),
+    vscode.commands.registerCommand(
+      "claudeCompanion.startNewSession",
+      () => void startNewSession({ auto: false }),
+    ),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration("claudeCompanion.autoStartSession")) return;
+      // Re-arm (or tear down) against the current reset time immediately
+      // rather than waiting up to 5 minutes for the next poll.
+      clearResetTimer();
+      if (isAutoStartEnabled()) {
+        scheduleSessionPing(lastGoodUsage?.rate_limits?.five_hour.resets_at ?? null);
+      }
+    }),
   );
   context.subscriptions.push({ dispose: () => usageChannel.dispose() });
 
   void updateStatusBar();
   refreshTimer = setInterval(() => void updateStatusBar(), REFRESH_INTERVAL_MS);
   context.subscriptions.push({ dispose: () => clearInterval(refreshTimer) });
+  context.subscriptions.push({ dispose: () => clearResetTimer() });
 }
 
 export function deactivate(): void {
   if (refreshTimer) {
     clearInterval(refreshTimer);
   }
+  clearResetTimer();
+  pingChild?.kill();
+  pingChild = undefined;
   usageChannel.dispose();
+}
+
+function isAutoStartEnabled(): boolean {
+  return vscode.workspace
+    .getConfiguration("claudeCompanion")
+    .get<boolean>("autoStartSession.enabled", true);
+}
+
+function getPingPrompt(): string {
+  const configured = vscode.workspace
+    .getConfiguration("claudeCompanion")
+    .get<string>("autoStartSession.prompt", "hi");
+  return configured.trim() || "hi";
+}
+
+function clearResetTimer(): void {
+  if (resetTimer) clearTimeout(resetTimer);
+  resetTimer = undefined;
+  scheduledResetIso = undefined;
+}
+
+/**
+ * Arms a one-shot timer for the moment the current 5h window expires. Called
+ * on every successful poll: if the reset time is unchanged the existing timer
+ * stands, and once a boundary has been pinged it is never pinged again (the
+ * API keeps reporting the old `resets_at` for a while after expiry).
+ */
+function scheduleSessionPing(resetsAt: string | null): void {
+  if (!isAutoStartEnabled() || !resetsAt) return;
+  if (resetsAt === lastPingedResetIso) return;
+  if (resetsAt === scheduledResetIso && resetTimer) return;
+
+  const resetDate = new Date(resetsAt);
+  if (Number.isNaN(resetDate.getTime())) return;
+
+  clearResetTimer();
+  scheduledResetIso = resetsAt;
+  const delay = Math.max(resetDate.getTime() - Date.now() + PING_GRACE_MS, 0);
+  resetTimer = setTimeout(() => {
+    resetTimer = undefined;
+    scheduledResetIso = undefined;
+    lastPingedResetIso = resetsAt;
+    void startNewSession({ auto: true }).then(() => updateStatusBar());
+  }, delay);
+}
+
+/**
+ * Opens a fresh 5h window by running one trivial `claude -p` turn. Runs from
+ * the temp dir rather than a workspace folder so no project CLAUDE.md or repo
+ * context is pulled into a throwaway prompt.
+ */
+function startNewSession(opts: { auto: boolean }): Promise<void> {
+  if (opts.auto && !isAutoStartEnabled()) return Promise.resolve();
+  if (pingChild) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(findClaudeBinary(), ["-p", getPingPrompt(), "--max-turns", "1"], {
+        cwd: os.tmpdir(),
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+    } catch (err) {
+      reportPingFailure(opts, err instanceof Error ? err.message : String(err));
+      resolve();
+      return;
+    }
+
+    pingChild = child;
+    let stderr = "";
+    let settled = false;
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const finish = (message?: string): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (pingChild === child) pingChild = undefined;
+      if (message) {
+        reportPingFailure(opts, message);
+      } else if (!opts.auto) {
+        vscode.window.setStatusBarMessage("$(check) Claude: new session started", 5_000);
+      }
+      resolve();
+    };
+
+    timeout = setTimeout(() => {
+      child.kill();
+      finish("Timed out waiting for Claude Code CLI");
+    }, PING_TIMEOUT_MS);
+
+    child.on("error", (err: Error) => finish(`Failed to launch Claude Code CLI: ${err.message}`));
+    child.on("close", (code: number | null) => {
+      if (code === 0) {
+        finish();
+        return;
+      }
+      const detail = stderr.trim().split("\n").pop();
+      finish(`claude exited with code ${code}${detail ? `: ${detail}` : ""}`);
+    });
+  });
+}
+
+function reportPingFailure(opts: { auto: boolean }, message: string): void {
+  const prefix = opts.auto ? "Could not auto-start a new Claude session" : "Could not start a new Claude session";
+  void vscode.window.showWarningMessage(`${prefix}: ${message}`);
 }
 
 async function updateStatusBar(): Promise<void> {
@@ -84,6 +227,7 @@ async function updateStatusBar(): Promise<void> {
       lastGoodUsage = usage;
       staleStreak = 0;
       renderUsage(usage);
+      scheduleSessionPing(fiveHour.resets_at);
       return;
     }
 
