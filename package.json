@@ -2,7 +2,7 @@
   "name": "claude-companion",
   "displayName": "Claude Companion",
   "description": "Claude Code session and weekly usage in the status bar, color-coded by burn rate, with automatic session restart when the 5h window resets and automatic continuation of work the limit cut off",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "local",
   "repository": {
     "type": "git",
@@ -50,20 +50,20 @@
         "claudeCompanion.autoResume.enabled": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "When a session in this workspace was cut off by the 5h limit, resume that same session once a fresh window opens so Claude continues the interrupted work. Takes the place of the `autoStartSession` ping for that reset."
+          "markdownDescription": "When a session in this workspace was cut off by the 5h limit, bring it back once a fresh window opens so the work can continue where it stopped. Takes the place of the `autoStartSession` ping for that reset. See `autoResume.mode` for what \"bring it back\" does."
         },
         "claudeCompanion.autoResume.mode": {
           "type": "string",
           "enum": [
-            "terminal",
+            "panel",
             "headless"
           ],
           "enumDescriptions": [
-            "Open the resumed session in a VS Code terminal, so you can watch it and answer permission prompts.",
-            "Run the resumed session in the background with `claude -p`. Nothing to watch, and tool calls needing permission are denied unless permissionMode allows them."
+            "Reopen the session in the Claude Code chat panel with the continue prompt staged in its input box. You press Enter to run it.",
+            "Run the resumed session in the background with `claude -p`, outside the Claude Code panel. Nothing to watch, and tool calls needing permission are denied unless permissionMode allows them."
           ],
-          "default": "terminal",
-          "description": "How the resumed session is launched."
+          "default": "panel",
+          "description": "Where the interrupted session is resumed."
         },
         "claudeCompanion.autoResume.prompt": {
           "type": "string",
@@ -85,7 +85,7 @@
             "Skip every permission check. Unattended writes and commands, so use with care."
           ],
           "default": "default",
-          "markdownDescription": "`--permission-mode` for the resumed session. In `headless` mode the normal setting cannot prompt you, so a resume that needs approvals will stall unless this is raised."
+          "markdownDescription": "`--permission-mode` for a `headless` resume, which cannot prompt you and so stalls on the first tool call needing approval unless this is raised. Ignored in `panel` mode, where the Claude Code panel applies its own permission settings."
         }
       }
     }

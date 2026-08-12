@@ -20,7 +20,7 @@ git clone https://github.com/arie-snfai/claude-companion.git
 cd claude-companion
 npm ci
 npx @vscode/vsce package                              # writes claude-companion-<version>.vsix
-code --install-extension claude-companion-0.1.0.vsix
+code --install-extension claude-companion-0.2.0.vsix
 ```
 
 Reload the window and the two status bar items appear.
@@ -31,8 +31,8 @@ to download: `*.vsix` is gitignored, and no build is attached to a
 [release](https://github.com/arie-snfai/claude-companion/releases) yet.
 
 ```bash
-scp claude-companion-0.1.0.vsix other-laptop:~/
-code --install-extension ~/claude-companion-0.1.0.vsix   # on that laptop
+scp claude-companion-0.2.0.vsix other-laptop:~/
+code --install-extension ~/claude-companion-0.2.0.vsix   # on that laptop
 ```
 
 **On a machine you have used Claude on before,** note that
@@ -86,9 +86,10 @@ is pulled into it.
 
 When Claude runs out of 5h quota mid-task it stops where it stands and writes
 `You've hit your session limit · resets 6:10am` into the session transcript. The
-extension notices, and once a fresh window is open it re-launches **that same
-session** with a "carry on from where you stopped" prompt, so Claude reads its
-own history instead of starting over.
+extension notices, and once a fresh window is open it reopens **that same
+session** in the Claude Code chat panel with a "carry on from where you stopped"
+prompt staged in the input box. Claude reads its own history instead of starting
+over, and the last keypress is yours.
 
 It fires in two situations:
 
@@ -115,19 +116,29 @@ Interrupted Session Now"**, which ignores the once-only rule.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `claudeCompanion.autoResume.enabled` | `true` | Resume interrupted work at reset |
-| `claudeCompanion.autoResume.mode` | `"terminal"` | `terminal` opens the resumed session in a VS Code terminal; `headless` runs it in the background via `claude -p` |
+| `claudeCompanion.autoResume.enabled` | `true` | Reopen interrupted work at reset |
+| `claudeCompanion.autoResume.mode` | `"panel"` | Where it resumes: the Claude Code panel, or `headless` |
 | `claudeCompanion.autoResume.prompt` | (see settings) | What the resumed session is told |
-| `claudeCompanion.autoResume.permissionMode` | `"default"` | `--permission-mode` for the resumed session |
+| `claudeCompanion.autoResume.permissionMode` | `"default"` | `--permission-mode`, `headless` only |
 
-`terminal` mode is the default because you can watch what Claude is doing and
-answer its permission prompts. `headless` mode keeps working while you are away
-from the machine, but nothing can answer a prompt for it: raise `permissionMode`
-to `acceptEdits` or higher, or the resume stalls on the first tool call that
-needs approval. `bypassPermissions` means unattended edits and shell commands, so
-choose it deliberately.
+**`panel`** hands the session back to the Claude Code extension, so it resumes
+where you were working, with your normal permission settings and full history.
+The prompt lands in the input box unsent, which means:
 
-Either way, the 5h tooltip tells you what is waiting before anything runs.
+- Press Enter and it carries on. Nothing runs unattended.
+- If that session still has a panel open, Claude Code reveals it and reports that
+  the prompt was not applied. It offers no way to type into a live panel, so you
+  write the continue instruction yourself. Closing the tab when the limit hits is
+  enough to get the staged prompt next time.
+
+**`headless`** actually runs the continuation, in the background via `claude -p`,
+outside the Claude Code panel. Use it when nobody will be at the machine. Nothing
+can answer a permission prompt for it, so raise `permissionMode` to `acceptEdits`
+or higher, or the resume stalls on the first tool call needing approval.
+`bypassPermissions` means unattended edits and shell commands, so choose it
+deliberately.
+
+Either way, the 5h tooltip tells you what is waiting before anything happens.
 
 ## How it works
 
@@ -148,6 +159,11 @@ transcripts under `~/.claude/projects/*/*.jsonl`, looking for the synthetic
 `rate_limit` entry Claude Code writes when quota runs out. That format is
 internal too. If it changes, the extension stops finding interrupted sessions and
 falls back to the plain reset ping rather than misfiring.
+
+Reopening a session uses a third: the Claude Code extension's
+`claude-vscode.editor.open` command, which takes a session id and an initial
+prompt. It is not part of any published API. If a future release drops it, the
+extension says so and points you at `headless` mode instead of failing quietly.
 
 This is an unofficial extension, not affiliated with Anthropic.
 

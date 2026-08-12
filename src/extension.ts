@@ -31,6 +31,12 @@ const HANDLED_RESUMES_KEY = "claudeCompanion.handledResumes";
 const MAX_HANDLED_RESUMES = 20;
 const MAX_TITLE_LENGTH = 80;
 
+// Undocumented command of the Claude Code extension, taking
+// (sessionId, initialPrompt, viewColumn). It resumes that session in a chat
+// panel and puts the prompt in the input box. Like `get_usage`, it is internal
+// and could change; a missing command is reported rather than worked around.
+const CLAUDE_OPEN_SESSION_COMMAND = "claude-vscode.editor.open";
+
 const DEFAULT_RESUME_PROMPT =
   "Your previous turn was cut off partway through because the 5-hour session limit was reached. " +
   "Re-read the end of this conversation and continue that work from exactly where it stopped. " +
@@ -157,7 +163,7 @@ function getResumePrompt(): string {
 
 function isHeadlessResume(): boolean {
   return (
-    vscode.workspace.getConfiguration("claudeCompanion").get<string>("autoResume.mode", "terminal") ===
+    vscode.workspace.getConfiguration("claudeCompanion").get<string>("autoResume.mode", "panel") ===
     "headless"
   );
 }
@@ -343,53 +349,71 @@ async function tryResumeInterrupted(opts: { auto: boolean }): Promise<ResumeOutc
 function launchResume(session: InterruptedSession): void {
   const label = formatTitle(session.title) ?? session.sessionId.slice(0, 8);
 
-  try {
-    launchResumeUnguarded(session, label);
-  } catch (err) {
-    void vscode.window.showWarningMessage(
-      `Could not resume the interrupted Claude session: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
-function launchResumeUnguarded(session: InterruptedSession, label: string): void {
-
   if (isHeadlessResume()) {
-    void vscode.window.showInformationMessage(`Claude is resuming interrupted work: ${label}`);
-    // Not awaited: the caller only launches the resume, it does not wait out
-    // however long the work takes.
-    void runClaude({
-      args: buildResumeArgs(session, { headless: true }),
-      cwd: session.cwd,
-      timeoutMs: RESUME_TIMEOUT_MS,
-      failurePrefix: "Could not resume the interrupted Claude session",
-      successMessage: "$(check) Claude: resumed session finished",
-    });
+    launchHeadlessResume(session, label);
     return;
   }
 
-  // Terminal mode: `claude` is the terminal's process, so the prompt reaches it
-  // as argv with no shell quoting in the way, and permission prompts still work
-  // because the session is interactive.
-  const terminal = vscode.window.createTerminal({
-    name: `Claude: resumed ${label}`,
-    cwd: session.cwd,
-    shellPath: findClaudeBinary(),
-    shellArgs: buildResumeArgs(session, { headless: false }),
-    iconPath: new vscode.ThemeIcon("debug-restart"),
+  void reopenInClaudePanel(session, label).catch((err: unknown) => {
+    void vscode.window.showWarningMessage(
+      `Could not resume the interrupted Claude session: ${err instanceof Error ? err.message : String(err)}`,
+    );
   });
-  // `true` keeps focus where the user left it.
-  terminal.show(true);
 }
 
-function buildResumeArgs(session: InterruptedSession, opts: { headless: boolean }): string[] {
+/**
+ * Hands the session back to the Claude Code extension, which resumes it in a
+ * chat panel with the continue prompt staged in the input box. The extension
+ * stages rather than sends it (its webview calls `setInputText`), so the last
+ * keypress stays the user's.
+ *
+ * If that session already has a panel open, the extension reveals it and says
+ * the prompt was not applied. There is no API for pushing a prompt into a live
+ * panel, so that case ends with the work in front of you and nothing typed.
+ */
+async function reopenInClaudePanel(session: InterruptedSession, label: string): Promise<void> {
+  const available = await vscode.commands.getCommands(true);
+  if (!available.includes(CLAUDE_OPEN_SESSION_COMMAND)) {
+    void vscode.window.showWarningMessage(
+      `Could not resume ${label} in Claude Code: this version of the Claude Code extension has no ` +
+        `${CLAUDE_OPEN_SESSION_COMMAND} command. Update it, or set ` +
+        `claudeCompanion.autoResume.mode to "headless".`,
+    );
+    return;
+  }
+
+  // (sessionId, prompt); the third argument is a ViewColumn, left out so the
+  // extension reuses whichever column already holds Claude panels.
+  await vscode.commands.executeCommand(
+    CLAUDE_OPEN_SESSION_COMMAND,
+    session.sessionId,
+    getResumePrompt(),
+  );
+  void vscode.window.showInformationMessage(
+    `Reopened the session the limit interrupted (${label}). The continue prompt is waiting in its input box.`,
+  );
+}
+
+function launchHeadlessResume(session: InterruptedSession, label: string): void {
+  void vscode.window.showInformationMessage(`Claude is resuming interrupted work: ${label}`);
+  // Not awaited: the caller only launches the resume, it does not wait out
+  // however long the work takes.
+  void runClaude({
+    args: buildResumeArgs(session),
+    cwd: session.cwd,
+    timeoutMs: RESUME_TIMEOUT_MS,
+    failurePrefix: "Could not resume the interrupted Claude session",
+    successMessage: "$(check) Claude: resumed session finished",
+  });
+}
+
+function buildResumeArgs(session: InterruptedSession): string[] {
   const args = ["--resume", session.sessionId];
   const permissionMode = getResumePermissionMode();
   if (permissionMode !== "default") {
     args.push("--permission-mode", permissionMode);
   }
-  if (opts.headless) args.push("-p");
-  args.push(getResumePrompt());
+  args.push("-p", getResumePrompt());
   return args;
 }
 
@@ -578,7 +602,7 @@ function formatPendingResumeLine(): string {
   return (
     `\n\n**Interrupted work waiting${at}**` +
     (title ? `: ${title}` : "") +
-    "\n\nIt will be resumed automatically as soon as a window with room in it is open."
+    "\n\nIt will be reopened in Claude Code as soon as a window with room in it is open."
   );
 }
 
