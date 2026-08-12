@@ -1,7 +1,7 @@
 {
   "name": "claude-companion",
   "displayName": "Claude Companion",
-  "description": "Claude Code session and weekly usage in the status bar, color-coded by burn rate, with automatic session restart when the 5h window resets",
+  "description": "Claude Code session and weekly usage in the status bar, color-coded by burn rate, with automatic session restart when the 5h window resets and automatic continuation of work the limit cut off",
   "version": "0.0.1",
   "publisher": "local",
   "repository": {
@@ -28,6 +28,10 @@
       {
         "command": "claudeCompanion.startNewSession",
         "title": "Claude Companion: Start New Session Now"
+      },
+      {
+        "command": "claudeCompanion.resumeInterruptedSession",
+        "title": "Claude Companion: Resume Interrupted Session Now"
       }
     ],
     "configuration": {
@@ -41,7 +45,47 @@
         "claudeCompanion.autoStartSession.prompt": {
           "type": "string",
           "default": "hi",
-          "description": "Prompt sent to start the new session. Keep it trivial — it is only there to open the window."
+          "description": "Prompt sent to start the new session. Keep it trivial: it is only there to open the window."
+        },
+        "claudeCompanion.autoResume.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When a session in this workspace was cut off by the 5h limit, resume that same session once a fresh window opens so Claude continues the interrupted work. Takes the place of the `autoStartSession` ping for that reset."
+        },
+        "claudeCompanion.autoResume.mode": {
+          "type": "string",
+          "enum": [
+            "terminal",
+            "headless"
+          ],
+          "enumDescriptions": [
+            "Open the resumed session in a VS Code terminal, so you can watch it and answer permission prompts.",
+            "Run the resumed session in the background with `claude -p`. Nothing to watch, and tool calls needing permission are denied unless permissionMode allows them."
+          ],
+          "default": "terminal",
+          "description": "How the resumed session is launched."
+        },
+        "claudeCompanion.autoResume.prompt": {
+          "type": "string",
+          "default": "Your previous turn was cut off partway through because the 5-hour session limit was reached. Re-read the end of this conversation and continue that work from exactly where it stopped. Do not start anything new.",
+          "description": "Prompt sent to the resumed session. The conversation history is already there; this only tells Claude to carry on."
+        },
+        "claudeCompanion.autoResume.permissionMode": {
+          "type": "string",
+          "enum": [
+            "default",
+            "acceptEdits",
+            "auto",
+            "bypassPermissions"
+          ],
+          "enumDescriptions": [
+            "Use your normal permission settings.",
+            "Auto-accept file edits; still ask for everything else.",
+            "Let Claude decide which tools it may run unprompted.",
+            "Skip every permission check. Unattended writes and commands, so use with care."
+          ],
+          "default": "default",
+          "markdownDescription": "`--permission-mode` for the resumed session. In `headless` mode the normal setting cannot prompt you, so a resume that needs approvals will stall unless this is raised."
         }
       }
     }
@@ -49,7 +93,8 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test out/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

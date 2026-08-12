@@ -1,11 +1,12 @@
 import * as vscode from "vscode";
-import * as fs from "fs";
 import * as os from "os";
-import * as path from "path";
-import { spawn, ChildProcess, ChildProcessWithoutNullStreams } from "child_process";
+import { spawn, ChildProcess } from "child_process";
+
+import { findClaudeBinary } from "./claudeBinary";
+import { findInterruptedSession, InterruptedSession } from "./interruptedSession";
+import { RateLimitWindow, UsageChannel, UsageResponse } from "./usageChannel";
 
 const REFRESH_INTERVAL_MS = 5 * 60_000;
-const REQUEST_TIMEOUT_MS = 8_000;
 const BAR_WIDTH = 10;
 // Consecutive polls with no usable data before we stop showing stale numbers
 // and fall back to the warning state (3 polls * 5 min interval = 15 min).
@@ -18,6 +19,22 @@ const PING_GRACE_MS = 5_000;
 // A one-shot `claude -p` turn is normally a few seconds; anything past this is
 // a hung process, not a slow answer.
 const PING_TIMEOUT_MS = 120_000;
+// A resumed turn does real work, so it gets far longer than a ping. This is a
+// backstop against a wedged process, not an expected duration.
+const RESUME_TIMEOUT_MS = 60 * 60_000;
+// Resuming into an almost-spent window would just hit the limit again a few
+// tool calls later, so wait for a window with room in it.
+const RESUME_MAX_UTILIZATION = 90;
+// Interruptions already acted on, so one limit hit is never resumed twice.
+// Capped because it only exists to suppress repeats, not as history.
+const HANDLED_RESUMES_KEY = "claudeCompanion.handledResumes";
+const MAX_HANDLED_RESUMES = 20;
+const MAX_TITLE_LENGTH = 80;
+
+const DEFAULT_RESUME_PROMPT =
+  "Your previous turn was cut off partway through because the 5-hour session limit was reached. " +
+  "Re-read the end of this conversation and continue that work from exactly where it stopped. " +
+  "Do not start anything new.";
 
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
@@ -28,20 +45,6 @@ const MIN_ELAPSED_MS = 60_000;
 const COLOR_GREEN = "#4CAF50";
 const COLOR_ORANGE = "#FF9800";
 const COLOR_RED = "#F44336";
-
-interface RateLimitWindow {
-  utilization: number | null;
-  resets_at: string | null;
-}
-
-interface UsageResponse {
-  rate_limits_available: boolean;
-  rate_limits: {
-    five_hour: RateLimitWindow;
-    seven_day: RateLimitWindow;
-  } | null;
-  subscription_type: string | null;
-}
 
 // One item per metric. VS Code status bar items only support a single
 // foreground color for their whole text (no way to color a substring), so
@@ -56,14 +59,25 @@ let lastGoodUsage: UsageResponse | undefined;
 let staleStreak = 0;
 
 // Auto-restart state. `scheduledResetIso` is the boundary the armed timer is
-// waiting on; `lastPingedResetIso` is the boundary we already acted on, so a
+// waiting on; `lastHandledResetIso` is the boundary we already acted on, so a
 // poll that still reports the old (now past) reset time can't re-fire.
 let resetTimer: ReturnType<typeof setTimeout> | undefined;
 let scheduledResetIso: string | undefined;
-let lastPingedResetIso: string | undefined;
-let pingChild: ChildProcess | undefined;
+let lastHandledResetIso: string | undefined;
+let activeChild: ChildProcess | undefined;
+
+// Work that the 5h limit cut off and that is waiting for a fresh window, kept
+// here so the status bar tooltip can say so before the resume fires.
+let pendingResume: InterruptedSession | undefined;
+// Set synchronously around a resume attempt. The reset timer and the poll can
+// both decide to resume at nearly the same moment, and the scan between that
+// decision and the launch is asynchronous, so without this they could each
+// launch the same session.
+let resumeInFlight = false;
+let globalState: vscode.Memento | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
+  globalState = context.globalState;
   sessionItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, -1_000_000);
   weeklyItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, -1_000_001);
 
@@ -80,14 +94,21 @@ export function activate(context: vscode.ExtensionContext): void {
       "claudeCompanion.startNewSession",
       () => void startNewSession({ auto: false }),
     ),
+    vscode.commands.registerCommand(
+      "claudeCompanion.resumeInterruptedSession",
+      () => void resumeInterruptedManually(),
+    ),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (!event.affectsConfiguration("claudeCompanion.autoStartSession")) return;
+      if (
+        !event.affectsConfiguration("claudeCompanion.autoStartSession") &&
+        !event.affectsConfiguration("claudeCompanion.autoResume")
+      ) {
+        return;
+      }
       // Re-arm (or tear down) against the current reset time immediately
       // rather than waiting up to 5 minutes for the next poll.
       clearResetTimer();
-      if (isAutoStartEnabled()) {
-        scheduleSessionPing(lastGoodUsage?.rate_limits?.five_hour.resets_at ?? null);
-      }
+      scheduleResetAction(lastGoodUsage?.rate_limits?.five_hour.resets_at ?? null);
     }),
   );
   context.subscriptions.push({ dispose: () => usageChannel.dispose() });
@@ -103,8 +124,8 @@ export function deactivate(): void {
     clearInterval(refreshTimer);
   }
   clearResetTimer();
-  pingChild?.kill();
-  pingChild = undefined;
+  activeChild?.kill();
+  activeChild = undefined;
   usageChannel.dispose();
 }
 
@@ -121,6 +142,39 @@ function getPingPrompt(): string {
   return configured.trim() || "hi";
 }
 
+function isAutoResumeEnabled(): boolean {
+  return vscode.workspace
+    .getConfiguration("claudeCompanion")
+    .get<boolean>("autoResume.enabled", true);
+}
+
+function getResumePrompt(): string {
+  const configured = vscode.workspace
+    .getConfiguration("claudeCompanion")
+    .get<string>("autoResume.prompt", DEFAULT_RESUME_PROMPT);
+  return configured.trim() || DEFAULT_RESUME_PROMPT;
+}
+
+function isHeadlessResume(): boolean {
+  return (
+    vscode.workspace.getConfiguration("claudeCompanion").get<string>("autoResume.mode", "terminal") ===
+    "headless"
+  );
+}
+
+function getResumePermissionMode(): string {
+  return vscode.workspace
+    .getConfiguration("claudeCompanion")
+    .get<string>("autoResume.permissionMode", "default");
+}
+
+/** Folders this window owns. Sessions elsewhere belong to another window. */
+function getWorkspaceRoots(): string[] {
+  return (vscode.workspace.workspaceFolders ?? [])
+    .filter((folder) => folder.uri.scheme === "file")
+    .map((folder) => folder.uri.fsPath);
+}
+
 function clearResetTimer(): void {
   if (resetTimer) clearTimeout(resetTimer);
   resetTimer = undefined;
@@ -130,12 +184,13 @@ function clearResetTimer(): void {
 /**
  * Arms a one-shot timer for the moment the current 5h window expires. Called
  * on every successful poll: if the reset time is unchanged the existing timer
- * stands, and once a boundary has been pinged it is never pinged again (the
+ * stands, and once a boundary has been acted on it is never acted on again (the
  * API keeps reporting the old `resets_at` for a while after expiry).
  */
-function scheduleSessionPing(resetsAt: string | null): void {
-  if (!isAutoStartEnabled() || !resetsAt) return;
-  if (resetsAt === lastPingedResetIso) return;
+function scheduleResetAction(resetsAt: string | null): void {
+  if (!isAutoStartEnabled() && !isAutoResumeEnabled()) return;
+  if (!resetsAt) return;
+  if (resetsAt === lastHandledResetIso) return;
   if (resetsAt === scheduledResetIso && resetTimer) return;
 
   const resetDate = new Date(resetsAt);
@@ -147,9 +202,20 @@ function scheduleSessionPing(resetsAt: string | null): void {
   resetTimer = setTimeout(() => {
     resetTimer = undefined;
     scheduledResetIso = undefined;
-    lastPingedResetIso = resetsAt;
-    void startNewSession({ auto: true }).then(() => updateStatusBar());
+    lastHandledResetIso = resetsAt;
+    void onWindowReset().then(() => updateStatusBar());
   }, delay);
+}
+
+/**
+ * Continuing interrupted work opens the new window by itself, so the trivial
+ * ping is only needed when there is nothing to resume.
+ */
+async function onWindowReset(): Promise<void> {
+  // "busy" also means something is already opening the window, so the ping is
+  // only needed when there was nothing to resume at all.
+  if ((await tryResumeInterrupted({ auto: true })) !== "none") return;
+  await startNewSession({ auto: true });
 }
 
 /**
@@ -159,22 +225,51 @@ function scheduleSessionPing(resetsAt: string | null): void {
  */
 function startNewSession(opts: { auto: boolean }): Promise<void> {
   if (opts.auto && !isAutoStartEnabled()) return Promise.resolve();
-  if (pingChild) return Promise.resolve();
+
+  return runClaude({
+    args: ["-p", getPingPrompt(), "--max-turns", "1"],
+    cwd: os.tmpdir(),
+    timeoutMs: PING_TIMEOUT_MS,
+    failurePrefix: opts.auto
+      ? "Could not auto-start a new Claude session"
+      : "Could not start a new Claude session",
+    successMessage: opts.auto ? undefined : "$(check) Claude: new session started",
+  }).then(() => undefined);
+}
+
+interface RunOptions {
+  args: string[];
+  cwd: string;
+  timeoutMs: number;
+  failurePrefix: string;
+  /** Shown briefly in the status bar on a clean exit; omit to stay silent. */
+  successMessage?: string;
+}
+
+/**
+ * Runs one `claude` process to completion, reporting failures as warnings. Only
+ * one runs at a time: a ping and a resume both open a window, so overlapping
+ * them would burn quota twice for one boundary.
+ */
+function runClaude(opts: RunOptions): Promise<boolean> {
+  if (activeChild) return Promise.resolve(false);
 
   return new Promise((resolve) => {
     let child: ChildProcess;
     try {
-      child = spawn(findClaudeBinary(), ["-p", getPingPrompt(), "--max-turns", "1"], {
-        cwd: os.tmpdir(),
+      child = spawn(findClaudeBinary(), opts.args, {
+        cwd: opts.cwd,
         stdio: ["ignore", "ignore", "pipe"],
       });
     } catch (err) {
-      reportPingFailure(opts, err instanceof Error ? err.message : String(err));
-      resolve();
+      void vscode.window.showWarningMessage(
+        `${opts.failurePrefix}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      resolve(false);
       return;
     }
 
-    pingChild = child;
+    activeChild = child;
     let stderr = "";
     let settled = false;
     child.stderr?.on("data", (chunk: Buffer) => {
@@ -186,19 +281,19 @@ function startNewSession(opts: { auto: boolean }): Promise<void> {
       if (settled) return;
       settled = true;
       if (timeout) clearTimeout(timeout);
-      if (pingChild === child) pingChild = undefined;
+      if (activeChild === child) activeChild = undefined;
       if (message) {
-        reportPingFailure(opts, message);
-      } else if (!opts.auto) {
-        vscode.window.setStatusBarMessage("$(check) Claude: new session started", 5_000);
+        void vscode.window.showWarningMessage(`${opts.failurePrefix}: ${message}`);
+      } else if (opts.successMessage) {
+        vscode.window.setStatusBarMessage(opts.successMessage, 5_000);
       }
-      resolve();
+      resolve(!message);
     };
 
     timeout = setTimeout(() => {
       child.kill();
       finish("Timed out waiting for Claude Code CLI");
-    }, PING_TIMEOUT_MS);
+    }, opts.timeoutMs);
 
     child.on("error", (err: Error) => finish(`Failed to launch Claude Code CLI: ${err.message}`));
     child.on("close", (code: number | null) => {
@@ -212,9 +307,153 @@ function startNewSession(opts: { auto: boolean }): Promise<void> {
   });
 }
 
-function reportPingFailure(opts: { auto: boolean }, message: string): void {
-  const prefix = opts.auto ? "Could not auto-start a new Claude session" : "Could not start a new Claude session";
-  void vscode.window.showWarningMessage(`${prefix}: ${message}`);
+type ResumeOutcome = "launched" | "none" | "busy";
+
+/**
+ * Picks up work that the 5h limit cut off, in the session it was cut off in, so
+ * Claude reads its own history and carries on instead of starting over.
+ *
+ * The interruption is marked handled before the launch, not after, so a failed
+ * resume is not retried in a loop. A *later* interruption of the same session
+ * is a different key, so long work can span several windows.
+ */
+async function tryResumeInterrupted(opts: { auto: boolean }): Promise<ResumeOutcome> {
+  if (opts.auto && !isAutoResumeEnabled()) return "none";
+  // A ping or an earlier resume is still running; it owns this window.
+  if (activeChild || resumeInFlight) return "busy";
+
+  resumeInFlight = true;
+  try {
+    // Re-scan rather than trusting `pendingResume`: the user may have picked the
+    // work back up by hand since it was detected.
+    const session = await findInterruptedSession(getWorkspaceRoots());
+    if (!session) return "none";
+    // Manual invocation is explicit intent, so it ignores the handled list.
+    if (opts.auto && isResumeHandled(session)) return "none";
+
+    await markResumeHandled(session);
+    pendingResume = undefined;
+    launchResume(session);
+    return "launched";
+  } finally {
+    resumeInFlight = false;
+  }
+}
+
+function launchResume(session: InterruptedSession): void {
+  const label = formatTitle(session.title) ?? session.sessionId.slice(0, 8);
+
+  try {
+    launchResumeUnguarded(session, label);
+  } catch (err) {
+    void vscode.window.showWarningMessage(
+      `Could not resume the interrupted Claude session: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+function launchResumeUnguarded(session: InterruptedSession, label: string): void {
+
+  if (isHeadlessResume()) {
+    void vscode.window.showInformationMessage(`Claude is resuming interrupted work: ${label}`);
+    // Not awaited: the caller only launches the resume, it does not wait out
+    // however long the work takes.
+    void runClaude({
+      args: buildResumeArgs(session, { headless: true }),
+      cwd: session.cwd,
+      timeoutMs: RESUME_TIMEOUT_MS,
+      failurePrefix: "Could not resume the interrupted Claude session",
+      successMessage: "$(check) Claude: resumed session finished",
+    });
+    return;
+  }
+
+  // Terminal mode: `claude` is the terminal's process, so the prompt reaches it
+  // as argv with no shell quoting in the way, and permission prompts still work
+  // because the session is interactive.
+  const terminal = vscode.window.createTerminal({
+    name: `Claude: resumed ${label}`,
+    cwd: session.cwd,
+    shellPath: findClaudeBinary(),
+    shellArgs: buildResumeArgs(session, { headless: false }),
+    iconPath: new vscode.ThemeIcon("debug-restart"),
+  });
+  // `true` keeps focus where the user left it.
+  terminal.show(true);
+}
+
+function buildResumeArgs(session: InterruptedSession, opts: { headless: boolean }): string[] {
+  const args = ["--resume", session.sessionId];
+  const permissionMode = getResumePermissionMode();
+  if (permissionMode !== "default") {
+    args.push("--permission-mode", permissionMode);
+  }
+  if (opts.headless) args.push("-p");
+  args.push(getResumePrompt());
+  return args;
+}
+
+async function resumeInterruptedManually(): Promise<void> {
+  const outcome = await tryResumeInterrupted({ auto: false });
+  if (outcome === "launched") return;
+
+  if (outcome === "busy") {
+    void vscode.window.showWarningMessage("A Claude session is already being started. Try again shortly.");
+    return;
+  }
+  void vscode.window.showInformationMessage(
+    "No session in this workspace was interrupted by the 5h limit.",
+  );
+}
+
+/** Identifies one interruption, so re-running into the limit gets its own turn. */
+function resumeKey(session: InterruptedSession): string {
+  return `${session.sessionId}@${session.interruptedAt}`;
+}
+
+function isResumeHandled(session: InterruptedSession): boolean {
+  return readHandledResumes().includes(resumeKey(session));
+}
+
+function readHandledResumes(): string[] {
+  return globalState?.get<string[]>(HANDLED_RESUMES_KEY, []) ?? [];
+}
+
+async function markResumeHandled(session: InterruptedSession): Promise<void> {
+  const handled = [...readHandledResumes(), resumeKey(session)];
+  await globalState?.update(HANDLED_RESUMES_KEY, handled.slice(-MAX_HANDLED_RESUMES));
+}
+
+/**
+ * Detects work waiting on a fresh window, and says whether it can go now. A
+ * limit hit inside the *current* window has to wait for the reset timer; one
+ * from an earlier window means the new window is already open.
+ */
+async function refreshPendingResume(fiveHour: RateLimitWindow): Promise<boolean> {
+  if (!isAutoResumeEnabled()) {
+    pendingResume = undefined;
+    return false;
+  }
+
+  const session = await findInterruptedSession(getWorkspaceRoots());
+  pendingResume = session && !isResumeHandled(session) ? session : undefined;
+  if (!pendingResume) return false;
+
+  return (
+    clampPercent(fiveHour.utilization) < RESUME_MAX_UTILIZATION &&
+    isNewWindow(pendingResume.interruptedAt, fiveHour.resets_at)
+  );
+}
+
+/** True when the interruption predates the window that is live right now. */
+function isNewWindow(interruptedAt: string, resetsAt: string | null): boolean {
+  const resetMs = resetsAt ? Date.parse(resetsAt) : Number.NaN;
+  // No live window to speak of: whatever runs next opens one.
+  if (Number.isNaN(resetMs) || resetMs <= Date.now()) return true;
+
+  const interruptedMs = Date.parse(interruptedAt);
+  if (Number.isNaN(interruptedMs)) return false;
+  return interruptedMs < resetMs - FIVE_HOUR_MS;
 }
 
 async function updateStatusBar(): Promise<void> {
@@ -226,8 +465,12 @@ async function updateStatusBar(): Promise<void> {
     if (usage.rate_limits_available && fiveHour && sevenDay) {
       lastGoodUsage = usage;
       staleStreak = 0;
+      const resumeNow = await refreshPendingResume(fiveHour);
       renderUsage(usage);
-      scheduleSessionPing(fiveHour.resets_at);
+      scheduleResetAction(fiveHour.resets_at);
+      // The window the work was waiting for is already open, most often
+      // because VS Code was closed when the reset went by.
+      if (resumeNow) void tryResumeInterrupted({ auto: true });
       return;
     }
 
@@ -268,6 +511,7 @@ function renderUsage(usage: UsageResponse, opts: { stale?: boolean } = {}): void
   sessionItem.tooltip = new vscode.MarkdownString(
     `**Claude session usage (5h window)**\n\n${sessionPct}% used\n\nResets ${formatResetLine(fiveHour.resets_at)}` +
       formatPaceLine(sessionRatio) +
+      formatPendingResumeLine() +
       staleNote,
   );
 
@@ -326,6 +570,27 @@ function formatPaceLine(paceRatio: number | null): string {
   return `\n\nBurn rate: ${paceRatio.toFixed(1)}x sustainable pace`;
 }
 
+function formatPendingResumeLine(): string {
+  if (!pendingResume) return "";
+  const when = new Date(pendingResume.interruptedAt);
+  const at = Number.isNaN(when.getTime()) ? "" : ` at ${when.toLocaleTimeString()}`;
+  const title = formatTitle(pendingResume.title);
+  return (
+    `\n\n**Interrupted work waiting${at}**` +
+    (title ? `: ${title}` : "") +
+    "\n\nIt will be resumed automatically as soon as a window with room in it is open."
+  );
+}
+
+/** Keeps a session title to one short line so tooltips stay readable. */
+function formatTitle(title: string | undefined): string | undefined {
+  const collapsed = title?.replace(/\s+/g, " ").trim();
+  if (!collapsed) return undefined;
+  return collapsed.length > MAX_TITLE_LENGTH
+    ? `${collapsed.slice(0, MAX_TITLE_LENGTH - 1)}…`
+    : collapsed;
+}
+
 function renderError(message: string): void {
   const warningBg = new vscode.ThemeColor("statusBarItem.warningBackground");
   sessionItem.text = "$(warning) Claude usage";
@@ -373,150 +638,7 @@ function formatResetLine(resetsAt: string | null): string {
   return `${relative} (${resetDate.toLocaleString()})`;
 }
 
-/**
- * The bundled CLI version ships with the VS Code extension and is known to
- * support the `get_usage` control request; a separately-installed `claude`
- * on PATH may be older and lack it, so prefer the bundled one when present.
- */
-function findClaudeBinary(): string {
-  const ext = vscode.extensions.getExtension("anthropic.claude-code");
-  if (ext) {
-    const binaryName = process.platform === "win32" ? "claude.exe" : "claude";
-    const bundledPath = path.join(ext.extensionPath, "resources", "native-binary", binaryName);
-    if (fs.existsSync(bundledPath)) {
-      return bundledPath;
-    }
-  }
-  return "claude";
-}
 
-interface PendingRequest {
-  resolve: (usage: UsageResponse) => void;
-  reject: (err: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-}
-
-/**
- * Keeps a single long-lived `claude` control-protocol process for the life of
- * the extension, instead of spawning a fresh one per poll. Spawning a new
- * process every minute was confirmed (via the VS Code extension host log) to
- * trip a bug in the real Claude Code extension's own channel-cleanup code
- * every time our process exited — one persistent process avoids that churn.
- */
-class UsageChannel {
-  private child: ChildProcessWithoutNullStreams | undefined;
-  private buffer = "";
-  private nextId = 1;
-  private pending = new Map<string, PendingRequest>();
-
-  request(): Promise<UsageResponse> {
-    const child = this.ensureChild();
-    const id = String(this.nextId++);
-
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error("Timed out waiting for Claude Code CLI"));
-      }, REQUEST_TIMEOUT_MS);
-
-      this.pending.set(id, { resolve, reject, timer });
-
-      child.stdin.write(
-        JSON.stringify({
-          type: "control_request",
-          request_id: id,
-          request: { subtype: "get_usage" },
-        }) + "\n",
-        (err) => {
-          if (err) {
-            this.pending.delete(id);
-            clearTimeout(timer);
-            reject(new Error(`Failed to write to Claude Code CLI: ${err.message}`));
-          }
-        },
-      );
-    });
-  }
-
-  dispose(): void {
-    this.failAllPending(new Error("Extension deactivated"));
-    this.child?.kill();
-    this.child = undefined;
-  }
-
-  private ensureChild(): ChildProcessWithoutNullStreams {
-    if (this.child && !this.child.killed) {
-      return this.child;
-    }
-
-    const binaryPath = findClaudeBinary();
-    const child = spawn(
-      binaryPath,
-      ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
-      { stdio: ["pipe", "pipe", "pipe"] },
-    );
-
-    child.stdout.on("data", (chunk: Buffer) => this.onStdout(chunk));
-    child.on("error", (err) => {
-      this.failAllPending(new Error(`Failed to launch Claude Code CLI: ${err.message}`));
-    });
-    child.on("close", () => {
-      this.failAllPending(new Error("Claude Code CLI process exited"));
-      if (this.child === child) {
-        this.child = undefined;
-      }
-    });
-
-    this.child = child;
-    this.buffer = "";
-    return child;
-  }
-
-  private onStdout(chunk: Buffer): void {
-    this.buffer += chunk.toString("utf8");
-    let idx: number;
-    while ((idx = this.buffer.indexOf("\n")) !== -1) {
-      const line = this.buffer.slice(0, idx).trim();
-      this.buffer = this.buffer.slice(idx + 1);
-      if (line) this.handleLine(line);
-    }
-  }
-
-  private handleLine(line: string): void {
-    let msg: any;
-    try {
-      msg = JSON.parse(line);
-    } catch {
-      return;
-    }
-    if (msg?.type !== "control_response") return;
-
-    const response = msg.response;
-    const id = response?.request_id;
-    if (!id || !this.pending.has(id)) return;
-
-    const pending = this.pending.get(id)!;
-    this.pending.delete(id);
-    clearTimeout(pending.timer);
-
-    if (response.subtype === "error") {
-      pending.reject(new Error(response.error ?? "Unknown control request error"));
-      return;
-    }
-    if (response.subtype === "success" && response.response) {
-      pending.resolve(response.response as UsageResponse);
-      return;
-    }
-    pending.reject(new Error("Unrecognized control response shape"));
-  }
-
-  private failAllPending(err: Error): void {
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(err);
-    }
-    this.pending.clear();
-  }
-}
-
+// One long-lived control-protocol process for the life of the extension; see
+// UsageChannel for why it is not spawned per poll.
 const usageChannel = new UsageChannel();
