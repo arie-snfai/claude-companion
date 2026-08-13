@@ -1,4 +1,5 @@
 src/**
+scripts/**
 out/**/*.test.js
 tsconfig.json
 .gitignore
