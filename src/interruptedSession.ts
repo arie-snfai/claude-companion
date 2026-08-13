@@ -88,6 +88,24 @@ export function isInsideRoots(cwd: string, roots: readonly string[]): boolean {
   });
 }
 
+/**
+ * True when both paths name the same directory, symlinks resolved. The Claude
+ * Code panel realpaths its own working directory, so a comparison against it
+ * has to do the same or a symlinked workspace looks like a different place.
+ */
+export async function isSameDirectory(left: string, right: string): Promise<boolean> {
+  const [a, b] = await Promise.all([realpathOrResolve(left), realpathOrResolve(right)]);
+  return normalizeForCompare(a) === normalizeForCompare(b);
+}
+
+async function realpathOrResolve(target: string): Promise<string> {
+  try {
+    return await fs.realpath(target);
+  } catch {
+    return path.resolve(target); // Gone or unreadable; compare the literal path.
+  }
+}
+
 function normalizeForCompare(target: string): string {
   const resolved = path.resolve(target);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;

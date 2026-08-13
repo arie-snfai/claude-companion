@@ -3,7 +3,7 @@ import * as os from "os";
 import { spawn, ChildProcess } from "child_process";
 
 import { findClaudeBinary } from "./claudeBinary";
-import { findInterruptedSession, InterruptedSession } from "./interruptedSession";
+import { findInterruptedSession, InterruptedSession, isSameDirectory } from "./interruptedSession";
 import { RateLimitWindow, UsageChannel, UsageResponse } from "./usageChannel";
 
 const REFRESH_INTERVAL_MS = 5 * 60_000;
@@ -372,6 +372,20 @@ function launchResume(session: InterruptedSession): void {
  * panel, so that case ends with the work in front of you and nothing typed.
  */
 async function reopenInClaudePanel(session: InterruptedSession, label: string): Promise<void> {
+  // The Claude panel lists sessions for one directory: the realpath of the
+  // window's first workspace folder. A session from anywhere else is not in that
+  // list, and the panel would quietly start a *new* conversation with the
+  // continue prompt in it, losing the history that makes resuming worth doing.
+  const primaryFolder = getWorkspaceRoots()[0];
+  if (!primaryFolder || !(await isSameDirectory(session.cwd, primaryFolder))) {
+    void vscode.window.showWarningMessage(
+      `Could not reopen ${label} in Claude Code: it ran in ${session.cwd}, but this window's Claude ` +
+        `panel only lists sessions from ${primaryFolder ?? "no folder"}. Open that folder as the ` +
+        `workspace root, or set claudeCompanion.autoResume.mode to "headless".`,
+    );
+    return;
+  }
+
   const available = await vscode.commands.getCommands(true);
   if (!available.includes(CLAUDE_OPEN_SESSION_COMMAND)) {
     void vscode.window.showWarningMessage(

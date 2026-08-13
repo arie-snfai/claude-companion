@@ -20,7 +20,7 @@ git clone https://github.com/arie-snfai/claude-companion.git
 cd claude-companion
 npm ci
 npx @vscode/vsce package                              # writes claude-companion-<version>.vsix
-code --install-extension claude-companion-0.2.0.vsix
+code --install-extension claude-companion-0.2.1.vsix
 ```
 
 Reload the window and the two status bar items appear.
@@ -31,8 +31,8 @@ to download: `*.vsix` is gitignored, and no build is attached to a
 [release](https://github.com/arie-snfai/claude-companion/releases) yet.
 
 ```bash
-scp claude-companion-0.2.0.vsix other-laptop:~/
-code --install-extension ~/claude-companion-0.2.0.vsix   # on that laptop
+scp claude-companion-0.2.1.vsix other-laptop:~/
+code --install-extension ~/claude-companion-0.2.1.vsix   # on that laptop
 ```
 
 **On a machine you have used Claude on before,** note that
@@ -121,15 +121,21 @@ Interrupted Session Now"**, which ignores the once-only rule.
 | `claudeCompanion.autoResume.prompt` | (see settings) | What the resumed session is told |
 | `claudeCompanion.autoResume.permissionMode` | `"default"` | `--permission-mode`, `headless` only |
 
-**`panel`** hands the session back to the Claude Code extension, so it resumes
-where you were working, with your normal permission settings and full history.
-The prompt lands in the input box unsent, which means:
+**`panel`** hands the session back to the Claude Code extension, so the same
+conversation resumes with its full history, in the surface you work in, under your
+normal permission settings. Three things to know:
 
-- Press Enter and it carries on. Nothing runs unattended.
+- The prompt lands in the input box unsent. Press Enter and it carries on, so
+  nothing runs unattended.
 - If that session still has a panel open, Claude Code reveals it and reports that
   the prompt was not applied. It offers no way to type into a live panel, so you
   write the continue instruction yourself. Closing the tab when the limit hits is
   enough to get the staged prompt next time.
+- The session must have run in **this window's first workspace folder**. The
+  Claude panel lists sessions for that one directory, so a session from a
+  subfolder or a second root folder is not resumable there; the extension says so
+  rather than letting Claude Code open an empty session with the prompt in it.
+  Use `headless` for those, since the CLI resumes by session id from anywhere.
 
 **`headless`** actually runs the continuation, in the background via `claude -p`,
 outside the Claude Code panel. Use it when nobody will be at the machine. Nothing

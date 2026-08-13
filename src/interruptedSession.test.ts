@@ -4,7 +4,7 @@ import * as path from "path";
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 
-import { findInterruptedSession, isInsideRoots } from "./interruptedSession";
+import { findInterruptedSession, isInsideRoots, isSameDirectory } from "./interruptedSession";
 
 const NOW = Date.parse("2026-08-12T12:00:00.000Z");
 const HOUR_MS = 60 * 60 * 1000;
@@ -285,6 +285,26 @@ test("returns nothing when there is no transcript history at all", async () => {
   await reset();
 
   assert.equal(await scan(), undefined);
+});
+
+test("isSameDirectory follows symlinks, and separates sibling directories", async () => {
+  const real = path.join(sandbox, "real-project");
+  const link = path.join(sandbox, "linked-project");
+  const sibling = path.join(sandbox, "other-project");
+  await fs.mkdir(real, { recursive: true });
+  await fs.mkdir(sibling, { recursive: true });
+  await fs.symlink(real, link, "dir");
+
+  // A symlinked workspace path and its target are the same place, which is what
+  // the Claude panel's realpath'd cwd requires.
+  assert.equal(await isSameDirectory(link, real), true);
+  assert.equal(await isSameDirectory(real, real), true);
+  assert.equal(await isSameDirectory(`${real}${path.sep}`, real), true);
+  assert.equal(await isSameDirectory(sibling, real), false);
+  // A nested directory is NOT the same directory: the panel would not find it.
+  assert.equal(await isSameDirectory(path.join(real, "src"), real), false);
+  // Paths that do not exist still compare literally rather than throwing.
+  assert.equal(await isSameDirectory(path.join(sandbox, "gone"), real), false);
 });
 
 test("isInsideRoots matches the root itself and nested paths only", () => {
